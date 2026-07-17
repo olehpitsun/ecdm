@@ -1,0 +1,65 @@
+services:
+  dependency-service:
+    build:
+      context: ./dependency
+    container_name: ecdm-dependency
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+
+  app-service:
+    build:
+      context: ./app
+    container_name: ecdm-app
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    depends_on:
+      - dependency-service
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: ecdm-prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    depends_on:
+      - app-service
+
+  ecdm-engine:
+    build:
+      context: ./engine
+    container_name: ecdm-engine
+    restart: unless-stopped
+    ports:
+      - "8100:8100"
+    environment:
+      APP_URL: http://app-service:8000
+      PROMETHEUS_URL: http://prometheus:9090
+      DATA_FILE: /data/experiment_results.csv
+    volumes:
+      - ./data:/data
+    depends_on:
+      - app-service
+      - prometheus
+
+  dashboard:
+    build:
+      context: ./dashboard
+    container_name: ecdm-dashboard
+    restart: unless-stopped
+    ports:
+      - "8501:8501"
+    depends_on:
+      - ecdm-engine
+
+ analysis:
+    build:
+      context: ./analysis
+    container_name: ecdm-analysis
+    volumes:
+      - ./data:/data
+    profiles:
+      - analysis

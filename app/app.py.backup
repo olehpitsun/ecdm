@@ -1,0 +1,208 @@
+import random
+import threading
+import time
+from collections import deque
+
+import psutil
+from flask import Flask, jsonify, request
+from prometheus_client import (
+    CONTENT_TYPE_LATEST,
+    Counter,
+    Gauge,
+    Histogram,
+    generate_latest,
+)
+
+app = Flask(__name__)
+
+REQUESTS = Counter(
+    "ecdm_requests_total",
+    "Total number of requests",
+    ["status"],
+)
+
+LATENCY = Histogram(
+    "ecdm_request_latency_seconds",
+    "Request processing latency",
+)
+
+CPU_USAGE = Gauge(
+    "ecdm_cpu_usage_percent",
+    "Application process CPU usage",
+)
+
+MEMORY_USAGE = Gauge(
+    "ecdm_memory_usage_percent",
+    "Application process memory usage",
+)
+
+MEMORY_ALLOCATED = Gauge(
+    "ecdm_memory_allocated_mb",
+    "Memory allocated by the injected memory fault",
+)
+
+ERROR_RATE = Gauge(
+    "ecdm_error_rate_percent",
+    "Rolling request error rate",
+)
+
+FAULT_ACTIVE = Gauge(
+    "ecdm_fault_active",
+    "Current fault state",
+    ["fault_type"],
+)
+
+state = {
+    "cpu_load": 0.0,
+    "latency_ms": 0,
+    "error_probability": 0.0,
+    "memory_mb": 0,
+}
+
+memory_blocks = []
+recent_results = deque(maxlen=100)
+
+
+def monitor_process():
+    process = psutil.Process()
+
+    while True:
+        CPU_USAGE.set(process.cpu_percent(interval=None))
+        MEMORY_USAGE.set(process.memory_percent())
+        MEMORY_ALLOCATED.set(state["memory_mb"])
+
+        if recent_results:
+            errors = sum(1 for success in recent_results if not success)
+            ERROR_RATE.set(errors / len(recent_results) * 100)
+
+        time.sleep(1)
+
+
+def cpu_worker():
+    while True:
+        load = max(0.0, min(1.0, state["cpu_load"]))
+
+        if load == 0:
+            time.sleep(0.2)
+            continue
+
+        start = time.perf_counter()
+        busy_time = 0.1 * load
+
+        while time.perf_counter() - start < busy_time:
+            sum(i * i for i in range(2000))
+
+        time.sleep(max(0.0, 0.1 - busy_time))
+
+
+threading.Thread(target=monitor_process, daemon=True).start()
+threading.Thread(target=cpu_worker, daemon=True).start()
+
+
+@app.get("/")
+def index():
+    return jsonify(
+        service="ECDM test application",
+        status="running",
+    )
+
+
+@app.get("/health")
+def health():
+    return jsonify(
+        status="ok",
+        faults=state,
+    )
+
+
+@app.get("/work")
+@LATENCY.time()
+def work():
+    if state["latency_ms"] > 0:
+        time.sleep(state["latency_ms"] / 1000)
+
+    if random.random() < state["error_probability"]:
+        REQUESTS.labels(status="error").inc()
+        recent_results.append(False)
+
+        return jsonify(
+            status="error",
+            message="Injected application failure",
+        ), 500
+
+    REQUESTS.labels(status="success").inc()
+    recent_results.append(True)
+
+    return jsonify(
+        status="success",
+        result=42,
+    )
+
+
+@app.post("/fault")
+def apply_fault():
+    payload = request.get_json(silent=True) or {}
+
+    fault_type = payload.get("type", "clear")
+    severity = float(payload.get("severity", 0))
+
+    for name in ["cpu", "memory", "latency", "errors"]:
+        FAULT_ACTIVE.labels(fault_type=name).set(0)
+
+    if fault_type == "clear":
+        state["cpu_load"] = 0
+        state["latency_ms"] = 0
+        state["error_probability"] = 0
+        state["memory_mb"] = 0
+        memory_blocks.clear()
+
+    elif fault_type == "cpu":
+        state["cpu_load"] = max(0, min(1, severity))
+        FAULT_ACTIVE.labels(fault_type="cpu").set(1)
+
+    elif fault_type == "latency":
+        state["latency_ms"] = max(0, int(severity))
+        FAULT_ACTIVE.labels(fault_type="latency").set(1)
+
+    elif fault_type == "errors":
+        state["error_probability"] = max(0, min(1, severity))
+        FAULT_ACTIVE.labels(fault_type="errors").set(1)
+
+    elif fault_type == "memory":
+        target_mb = max(0, int(severity))
+
+        while len(memory_blocks) * 10 < target_mb:
+            memory_blocks.append(bytearray(10 * 1024 * 1024))
+
+        state["memory_mb"] = len(memory_blocks) * 10
+        FAULT_ACTIVE.labels(fault_type="memory").set(1)
+
+    else:
+        return jsonify(
+            status="error",
+            message=f"Unknown fault type: {fault_type}",
+        ), 400
+
+    return jsonify(
+        status="ok",
+        applied_fault=fault_type,
+        severity=severity,
+        state=state,
+    )
+
+
+@app.get("/metrics")
+def metrics():
+    return (
+        generate_latest(),
+        200,
+        {"Content-Type": CONTENT_TYPE_LATEST},
+    )
+
+
+if __name__ == "__main__":
+    app.run(
+        host="0.0.0.0",
+        port=8000,
+        threaded=True,
+    )

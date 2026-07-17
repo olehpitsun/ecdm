@@ -1,0 +1,7 @@
+| Scenario                    |   Runs |   Decision Accuracy (%) |   Recovery Success (%) |   Mean Confidence |   Mean Confidence Margin |   Mean Decision Latency (ms) |   Mean MTTR (ms) |   Availability Gain (pp) |
+|:----------------------------|-------:|------------------------:|-----------------------:|------------------:|-------------------------:|-----------------------------:|-----------------:|-------------------------:|
+| CPU Resource Exhaustion     |     30 |                   66.67 |                    100 |             0.643 |                    0.137 |                        0.034 |           23.232 |                     0    |
+| Memory Pressure             |     25 |                  100    |                    100 |             0.728 |                    0.111 |                        0.037 |           23.862 |                     0    |
+| Service Dependency Failure  |      5 |                  100    |                    100 |             0.934 |                    0.015 |                        0.042 |           13.434 |                   100    |
+| Application Latency         |     25 |                   52    |                    100 |             0.501 |                    0.048 |                        0.086 |          294.868 |                     0    |
+| Application Error Injection |     25 |                   96    |                    100 |             0.693 |                    0.152 |                        0.043 |           12.519 |                    25.67 |

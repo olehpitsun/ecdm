@@ -1,0 +1,11 @@
+Experimental Results
+
+The experimental campaign comprised 110 autonomous recovery episodes covering CPU resource exhaustion, memory pressure, service dependency failure, application latency, and application error injection. Each non-binary fault type was evaluated at multiple severity levels, and every configuration was repeatedly executed to reduce the influence of stochastic variation in workload generation and monitoring.
+
+Across all experimental episodes, the proposed ECDM framework achieved an overall decision accuracy of 79.09% and a recovery success rate of 100.00%. The mean overall decision confidence was 0.654, while the mean time to recovery was 82.231 ms. On average, the executed recovery actions increased service availability by 10.38 percentage points.
+
+The highest decision accuracy was observed for the Memory Pressure scenario, with an accuracy of 100.00%. The highest mean confidence was obtained for Service Dependency Failure (0.934). The lowest mean recovery time was measured for Application Error Injection (12.519 ms).
+
+The severity-level analysis demonstrates how the confidence assigned by the HDCM changes as the intensity of the injected fault increases. For CPU exhaustion, memory pressure, latency, and application error scenarios, the results are reported separately for every tested severity level. This analysis makes it possible to determine whether stronger runtime symptoms lead to clearer evidence, stronger hypothesis support, and a larger confidence margin between the selected recovery action and the competing alternatives.
+
+The availability measurements confirm that the framework does not only produce a recovery recommendation but also verifies the operational outcome of the selected action. The comparison of availability before and after recovery provides an outcome-based measure of practical recovery effectiveness. The recorded MTTR values additionally quantify the time required from the beginning of recovery execution until a successful service response is observed.
