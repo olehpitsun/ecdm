@@ -38,7 +38,23 @@ services:
     environment:
       APP_URL: http://app-service:8000
       PROMETHEUS_URL: http://prometheus:9090
-      DATA_FILE: /data/experiment_results.csv
+      DATA_FILE: /data/experiment_results_confirmatory.csv
+      RECOVERY_HISTORY_FILE: /data/recovery_history_confirmatory.json
+      CAMPAIGN_FILE: /data/campaign_results_confirmatory.csv
+      REFERENCE_POLICY_FILE: /engine/reference_policy.json
+      HDCM_ALPHA: "0.25"
+      HDCM_BETA: "0.25"
+      HDCM_GAMMA: "0.25"
+      HDCM_DELTA: "0.25"
+      HDCM_AGGREGATION_MODE: multiplicative
+      RECOVERY_PRIOR_ALPHA: "1.0"
+      RECOVERY_PRIOR_BETA: "1.0"
+      MIN_AUTONOMOUS_CONFIDENCE: "0.55"
+      MIN_CONFIDENCE_MARGIN: "0.03"
+      RECOVERY_REQUIRED_CONSECUTIVE_CHECKS: "3"
+      RECOVERY_VERIFICATION_MAX_ATTEMPTS: "20"
+      RECOVERY_VERIFICATION_INTERVAL_SECONDS: "0.5"
+      ACTION_EXECUTION_MODE: prototype_fault_reset
     volumes:
       - ./data:/data
     depends_on:
@@ -52,6 +68,8 @@ services:
     restart: unless-stopped
     ports:
       - "8501:8501"
+    environment:
+      ECDM_ENGINE_URL: http://ecdm-engine:8100
     depends_on:
       - ecdm-engine
 
@@ -63,3 +81,4 @@ services:
       - ./data:/data
     profiles:
       - analysis
+

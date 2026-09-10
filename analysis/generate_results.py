@@ -9,7 +9,7 @@ import pandas as pd
 
 
 DATA_FILE = Path(
-    "/data/campaign_results.csv"
+    "/data/campaign_results_confirmatory.csv"
 )
 
 OUTPUT_DIR = Path(

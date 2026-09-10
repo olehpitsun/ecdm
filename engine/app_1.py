@@ -1,5 +1,4 @@
 import csv
-import hashlib
 import json
 import os
 import statistics
@@ -46,58 +45,6 @@ RECOVERY_HISTORY_FILE.parent.mkdir(
     parents=True,
     exist_ok=True,
 )
-
-REFERENCE_POLICY_FILE = Path(
-    os.getenv(
-        "REFERENCE_POLICY_FILE",
-        str(Path(__file__).with_name("reference_policy.json")),
-    )
-)
-
-
-def _load_reference_policy():
-    try:
-        raw = REFERENCE_POLICY_FILE.read_bytes()
-        payload = json.loads(raw.decode("utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise RuntimeError(
-            f"Unable to load reference policy from {REFERENCE_POLICY_FILE}: {error}"
-        ) from error
-
-    if not isinstance(payload, dict) or not isinstance(payload.get("scenarios"), dict):
-        raise RuntimeError("Reference policy must contain a 'scenarios' object.")
-
-    digest = hashlib.sha256(raw).hexdigest()
-    return payload, digest
-
-
-REFERENCE_POLICY, REFERENCE_POLICY_SHA256 = _load_reference_policy()
-REFERENCE_POLICY_VERSION = str(REFERENCE_POLICY.get("policy_version", "unknown"))
-
-
-def get_reference_action(scenario_key, severity):
-    scenario_policy = REFERENCE_POLICY["scenarios"].get(scenario_key)
-    if not scenario_policy:
-        raise KeyError(f"No reference policy is defined for scenario '{scenario_key}'.")
-
-    rule_type = scenario_policy.get("rule_type")
-    numeric_severity = float(severity)
-
-    if rule_type == "threshold":
-        threshold = float(scenario_policy["threshold"])
-        if numeric_severity < threshold:
-            return scenario_policy["below_threshold_action"]
-        return scenario_policy["at_or_above_threshold_action"]
-
-    if rule_type == "binary_failure":
-        failure_value = float(scenario_policy.get("failure_value", 1.0))
-        if numeric_severity >= failure_value:
-            return scenario_policy["failure_action"]
-        return scenario_policy["healthy_action"]
-
-    raise ValueError(
-        f"Unsupported reference-policy rule_type '{rule_type}' for '{scenario_key}'."
-    )
 
 RECOVERY_PRIOR_ALPHA = float(
     os.getenv("RECOVERY_PRIOR_ALPHA", "1.0")
@@ -622,23 +569,6 @@ def execute_recovery(decision, scenario_key, safety):
     if not safety["allowed"]:
         return build_safety_hold_result(safety)
 
-    # "Do Nothing" is an observation policy, not an active recovery operation.
-    # It is therefore not subjected to fault-clear recovery verification and is
-    # excluded from active-recovery success/latency statistics.
-    if decision == "Do Nothing":
-        return {
-            "success": None,
-            "recovery_attempted": False,
-            "executed_decision": "Do Nothing",
-            "operator_escalation": False,
-            "safety_status": "autonomous_observation",
-            "safety_reason": "",
-            "action_execution_mode": ACTION_EXECUTION_MODE,
-            "recovery_verification_latency_ms": None,
-            "verification_attempts": 0,
-            "description": "No active recovery was executed; the system remained under observation.",
-        }
-
     recovery_started = time.perf_counter()
 
     try:
@@ -694,10 +624,6 @@ def execute_ranked_recovery(ranked, scenario_key):
 CSV_FIELDS = [
     "timestamp",
     "scenario",
-    "severity",
-    "reference_policy_version",
-    "reference_policy_sha256",
-    "expected_decision",
     "cpu",
     "memory",
     "allocated_memory_mb",
@@ -757,8 +683,6 @@ def save_result(row):
 
 def build_result_row(
     scenario,
-    scenario_key,
-    severity,
     observation,
     selected,
     second,
@@ -775,10 +699,6 @@ def build_result_row(
             .isoformat()
         ),
         "scenario": scenario,
-        "severity": severity,
-        "reference_policy_version": REFERENCE_POLICY_VERSION,
-        "reference_policy_sha256": REFERENCE_POLICY_SHA256,
-        "expected_decision": expected_decision,
         "cpu": round(
             observation.get("cpu", 0),
             4,
@@ -841,19 +761,15 @@ def build_result_row(
             decision_latency_ms,
             6,
         ),
-        "recovery_success": (
-            "" if recovery.get("success") is None
-            else int(bool(recovery.get("success")))
-        ),
+        "recovery_success": int(recovery["success"]),
         "recovery_attempted": int(recovery.get("recovery_attempted", False)),
         "operator_escalation": int(recovery.get("operator_escalation", False)),
         "safety_status": recovery.get("safety_status", ""),
         "safety_reason": recovery.get("safety_reason", ""),
         "action_execution_mode": recovery.get("action_execution_mode", ACTION_EXECUTION_MODE),
-        "recovery_verification_latency_ms": (
-            ""
-            if recovery.get("recovery_verification_latency_ms") is None
-            else round(recovery.get("recovery_verification_latency_ms", 0.0), 4)
+        "recovery_verification_latency_ms": round(
+            recovery.get("recovery_verification_latency_ms", 0.0),
+            4,
         ),
         "verification_attempts": (
             recovery[
@@ -1007,12 +923,10 @@ def run_cpu_scenario():
 
     row = build_result_row(
         scenario="CPU Resource Exhaustion",
-        scenario_key="cpu",
-        severity=severity,
         observation=observation,
         selected=selected,
         second=second,
-        expected_decision=get_reference_action("cpu", severity),
+        expected_decision="Scale Out",
         decision_latency_ms=decision_latency_ms,
         recovery=recovery,
         pre_load=pre_load,
@@ -1036,8 +950,6 @@ def run_cpu_scenario():
         pre_recovery=pre_load,
         post_recovery=post_load,
         explanation=explanation,
-        expected_decision=get_reference_action("cpu", severity),
-        reference_policy_version=REFERENCE_POLICY_VERSION,
         csv_file=str(DATA_FILE),
     )
 
@@ -1176,12 +1088,12 @@ def run_memory_scenario():
 
     row = build_result_row(
         scenario="Memory Pressure",
-        scenario_key="memory",
-        severity=severity,
         observation=observation,
         selected=selected,
         second=second,
-        expected_decision=get_reference_action("memory", severity),
+        expected_decision=(
+            "Restart Service"
+        ),
         decision_latency_ms=decision_latency_ms,
         recovery=recovery,
         pre_load=pre_load,
@@ -1205,8 +1117,6 @@ def run_memory_scenario():
         pre_recovery=pre_load,
         post_recovery=post_load,
         explanation=explanation,
-        expected_decision=get_reference_action("memory", severity),
-        reference_policy_version=REFERENCE_POLICY_VERSION,
         csv_file=str(DATA_FILE),
     )
 
@@ -1304,9 +1214,6 @@ def calculate_dependency_scenario_scores(
 
 @app.post("/run/dependency")
 def run_dependency_scenario():
-    payload = request.get_json(silent=True) or {}
-    severity = float(payload.get("severity", 1.0))
-
     clear_fault()
     time.sleep(2)
 
@@ -1317,7 +1224,7 @@ def run_dependency_scenario():
 
     apply_fault(
         "dependency",
-        severity,
+        1,
     )
 
     pre_load = generate_load(
@@ -1371,12 +1278,12 @@ def run_dependency_scenario():
         scenario=(
             "Service Dependency Failure"
         ),
-        scenario_key="dependency",
-        severity=severity,
         observation=observation,
         selected=selected,
         second=second,
-        expected_decision=get_reference_action("dependency", severity),
+        expected_decision=(
+            "Restart Dependency"
+        ),
         decision_latency_ms=decision_latency_ms,
         recovery=recovery,
         pre_load=pre_load,
@@ -1402,8 +1309,6 @@ def run_dependency_scenario():
         pre_recovery=pre_load,
         post_recovery=post_load,
         explanation=explanation,
-        expected_decision=get_reference_action("dependency", severity),
-        reference_policy_version=REFERENCE_POLICY_VERSION,
         csv_file=str(DATA_FILE),
     )
 
@@ -1591,12 +1496,10 @@ def run_latency_scenario():
 
     row = build_result_row(
         scenario="Application Latency",
-        scenario_key="latency",
-        severity=severity,
         observation=observation,
         selected=selected,
         second=second,
-        expected_decision=get_reference_action("latency", severity),
+        expected_decision="Rollback",
         decision_latency_ms=decision_latency_ms,
         recovery=recovery,
         pre_load=pre_load,
@@ -1620,8 +1523,6 @@ def run_latency_scenario():
         pre_recovery=pre_load,
         post_recovery=post_load,
         explanation=explanation,
-        expected_decision=get_reference_action("latency", severity),
-        reference_policy_version=REFERENCE_POLICY_VERSION,
         csv_file=str(DATA_FILE),
     )
 
@@ -1811,12 +1712,10 @@ def run_error_scenario():
 
     row = build_result_row(
         scenario="Application Error Injection",
-        scenario_key="errors",
-        severity=severity,
         observation=observation,
         selected=selected,
         second=second,
-        expected_decision=get_reference_action("errors", severity),
+        expected_decision="Rollback",
         decision_latency_ms=decision_latency_ms,
         recovery=recovery,
         pre_load=pre_load,
@@ -1840,8 +1739,6 @@ def run_error_scenario():
         pre_recovery=pre_load,
         post_recovery=post_load,
         explanation=explanation,
-        expected_decision=get_reference_action("errors", severity),
-        reference_policy_version=REFERENCE_POLICY_VERSION,
         csv_file=str(DATA_FILE),
     )
 
@@ -1927,6 +1824,8 @@ def run_batch_experiments():
                         "selected_decision": (
                             payload_data.get(
                                 "selected_decision",
+    "executed_decision",
+    "aggregation_mode",
                                 {},
                             ).get(
                                 "decision",
@@ -1936,6 +1835,8 @@ def run_batch_experiments():
                         "confidence": (
                             payload_data.get(
                                 "selected_decision",
+    "executed_decision",
+    "aggregation_mode",
                                 {},
                             ).get(
                                 "confidence",
@@ -1981,7 +1882,10 @@ def run_batch_experiments():
 
     return jsonify(
         status="completed",
-        repetitions=repetitions,
+        repetitions_by_scenario={
+            scenario: repetitions_by_scenario[scenario]
+            for scenario in selected_scenarios
+        },
         scenarios=selected_scenarios,
         expected_episodes=(
             repetitions
@@ -2004,7 +1908,7 @@ def run_batch_experiments():
 import uuid
 
 
-CAMPAIGN_FILE = Path(os.getenv("CAMPAIGN_FILE", str(DATA_FILE.parent / "campaign_results_confirmatory.csv")))
+CAMPAIGN_FILE = DATA_FILE.parent / "campaign_results_revised.csv"
 
 campaign_state = {
     "status": "idle",
@@ -2070,8 +1974,6 @@ CAMPAIGN_FIELDS = [
     "repetition",
     "scenario",
     "severity",
-    "reference_policy_version",
-    "reference_policy_sha256",
     "selected_decision",
     "executed_decision",
     "aggregation_mode",
@@ -2103,6 +2005,13 @@ CAMPAIGN_FIELDS = [
 ]
 
 
+EXPECTED_DECISIONS = {
+    "cpu": "Scale Out",
+    "memory": "Restart Service",
+    "dependency": "Restart Dependency",
+    "latency": "Rollback",
+    "errors": "Rollback",
+}
 
 
 def save_campaign_result(row):
@@ -2196,10 +2105,9 @@ def execute_campaign(
             pre = result["pre_recovery"]
             post = result["post_recovery"]
 
-            expected = get_reference_action(
-                scenario,
-                severity,
-            )
+            expected = EXPECTED_DECISIONS[
+                scenario
+            ]
 
             ranked = result[
                 "ranked_decisions"
@@ -2220,8 +2128,6 @@ def execute_campaign(
                 "repetition": repetition,
                 "scenario": scenario,
                 "severity": severity,
-                "reference_policy_version": REFERENCE_POLICY_VERSION,
-                "reference_policy_sha256": REFERENCE_POLICY_SHA256,
                 "selected_decision": (
                     selected["decision"]
                 ),
@@ -2249,18 +2155,16 @@ def execute_campaign(
                         0,
                     )
                 ),
-                "recovery_success": (
-                    "" if recovery.get("success") is None
-                    else int(bool(recovery.get("success")))
+                "recovery_success": int(
+                    recovery["success"]
                 ),
                 "recovery_attempted": int(recovery.get("recovery_attempted", False)),
                 "operator_escalation": int(recovery.get("operator_escalation", False)),
                 "safety_status": recovery.get("safety_status", ""),
                 "safety_reason": recovery.get("safety_reason", ""),
                 "action_execution_mode": recovery.get("action_execution_mode", ACTION_EXECUTION_MODE),
-                "recovery_verification_latency_ms": (
-                    "" if recovery.get("recovery_verification_latency_ms") is None
-                    else recovery.get("recovery_verification_latency_ms", 0)
+                "recovery_verification_latency_ms": recovery.get(
+                    "recovery_verification_latency_ms", 0
                 ),
                 "pre_availability": (
                     pre["availability"]
@@ -2432,9 +2336,6 @@ def start_campaign():
         scenarios=selected_scenarios,
         total_episodes=total,
         recovery_history_reset=reset_history,
-        reference_policy_version=REFERENCE_POLICY_VERSION,
-        reference_policy_sha256=REFERENCE_POLICY_SHA256,
-        reference_policy_file=str(REFERENCE_POLICY_FILE),
         initial_recovery_confidence=(
             RECOVERY_PRIOR_ALPHA / (RECOVERY_PRIOR_ALPHA + RECOVERY_PRIOR_BETA)
             if RECOVERY_PRIOR_ALPHA + RECOVERY_PRIOR_BETA > 0
@@ -2486,15 +2387,6 @@ def campaign_results():
     )
 
 
-@app.get("/reference-policy")
-def reference_policy():
-    return jsonify(
-        status="ok",
-        sha256=REFERENCE_POLICY_SHA256,
-        policy=REFERENCE_POLICY,
-    )
-
-
 @app.get("/history")
 def recovery_history():
     return jsonify(
@@ -2530,9 +2422,6 @@ def health():
         data_file=str(DATA_FILE),
         campaign_file=str(CAMPAIGN_FILE),
         recovery_history_file=str(RECOVERY_HISTORY_FILE),
-        reference_policy_file=str(REFERENCE_POLICY_FILE),
-        reference_policy_version=REFERENCE_POLICY_VERSION,
-        reference_policy_sha256=REFERENCE_POLICY_SHA256,
         hdcm_weights=HDCM_WEIGHTS,
         hdcm_aggregation_mode=HDCM_AGGREGATION_MODE,
         minimum_autonomous_confidence=MIN_AUTONOMOUS_CONFIDENCE,
@@ -2579,7 +2468,6 @@ def routes():
             "/campaign/start",
             "/campaign/status",
             "/campaign/results",
-            "/reference-policy",
             "/history",
             "/history/reset",
         ]

@@ -1,9 +1,6 @@
 import csv
-import hashlib
-import json
 import os
 import statistics
-import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -36,127 +33,6 @@ DATA_FILE.parent.mkdir(
     exist_ok=True,
 )
 
-RECOVERY_HISTORY_FILE = Path(
-    os.getenv(
-        "RECOVERY_HISTORY_FILE",
-        "/data/recovery_history.json",
-    )
-)
-RECOVERY_HISTORY_FILE.parent.mkdir(
-    parents=True,
-    exist_ok=True,
-)
-
-REFERENCE_POLICY_FILE = Path(
-    os.getenv(
-        "REFERENCE_POLICY_FILE",
-        str(Path(__file__).with_name("reference_policy.json")),
-    )
-)
-
-
-def _load_reference_policy():
-    try:
-        raw = REFERENCE_POLICY_FILE.read_bytes()
-        payload = json.loads(raw.decode("utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise RuntimeError(
-            f"Unable to load reference policy from {REFERENCE_POLICY_FILE}: {error}"
-        ) from error
-
-    if not isinstance(payload, dict) or not isinstance(payload.get("scenarios"), dict):
-        raise RuntimeError("Reference policy must contain a 'scenarios' object.")
-
-    digest = hashlib.sha256(raw).hexdigest()
-    return payload, digest
-
-
-REFERENCE_POLICY, REFERENCE_POLICY_SHA256 = _load_reference_policy()
-REFERENCE_POLICY_VERSION = str(REFERENCE_POLICY.get("policy_version", "unknown"))
-
-
-def get_reference_action(scenario_key, severity):
-    scenario_policy = REFERENCE_POLICY["scenarios"].get(scenario_key)
-    if not scenario_policy:
-        raise KeyError(f"No reference policy is defined for scenario '{scenario_key}'.")
-
-    rule_type = scenario_policy.get("rule_type")
-    numeric_severity = float(severity)
-
-    if rule_type == "threshold":
-        threshold = float(scenario_policy["threshold"])
-        if numeric_severity < threshold:
-            return scenario_policy["below_threshold_action"]
-        return scenario_policy["at_or_above_threshold_action"]
-
-    if rule_type == "binary_failure":
-        failure_value = float(scenario_policy.get("failure_value", 1.0))
-        if numeric_severity >= failure_value:
-            return scenario_policy["failure_action"]
-        return scenario_policy["healthy_action"]
-
-    raise ValueError(
-        f"Unsupported reference-policy rule_type '{rule_type}' for '{scenario_key}'."
-    )
-
-RECOVERY_PRIOR_ALPHA = float(
-    os.getenv("RECOVERY_PRIOR_ALPHA", "1.0")
-)
-RECOVERY_PRIOR_BETA = float(
-    os.getenv("RECOVERY_PRIOR_BETA", "1.0")
-)
-
-MIN_AUTONOMOUS_CONFIDENCE = float(
-    os.getenv("MIN_AUTONOMOUS_CONFIDENCE", "0.55")
-)
-MIN_CONFIDENCE_MARGIN = float(
-    os.getenv("MIN_CONFIDENCE_MARGIN", "0.03")
-)
-RECOVERY_VERIFICATION_MAX_ATTEMPTS = int(
-    os.getenv("RECOVERY_VERIFICATION_MAX_ATTEMPTS", "20")
-)
-RECOVERY_VERIFICATION_INTERVAL_SECONDS = float(
-    os.getenv("RECOVERY_VERIFICATION_INTERVAL_SECONDS", "0.5")
-)
-RECOVERY_REQUIRED_CONSECUTIVE_CHECKS = int(
-    os.getenv("RECOVERY_REQUIRED_CONSECUTIVE_CHECKS", "3")
-)
-
-ACTION_EXECUTION_MODE = os.getenv(
-    "ACTION_EXECUTION_MODE",
-    "prototype_fault_reset",
-)
-
-AUTONOMOUS_ACTION_ALLOWLIST = {
-    action.strip()
-    for action in os.getenv(
-        "AUTONOMOUS_ACTION_ALLOWLIST",
-        "Scale Out,Restart Service,Restart Dependency,Circuit Breaker,Rollback,Do Nothing",
-    ).split(",")
-    if action.strip()
-}
-
-_raw_hdcm_weights = {
-    "ce": float(os.getenv("HDCM_ALPHA", "0.25")),
-    "ch": float(os.getenv("HDCM_BETA", "0.25")),
-    "cc": float(os.getenv("HDCM_GAMMA", "0.25")),
-    "cr": float(os.getenv("HDCM_DELTA", "0.25")),
-}
-_weight_sum = sum(max(value, 0.0) for value in _raw_hdcm_weights.values())
-if _weight_sum <= 0:
-    _raw_hdcm_weights = {"ce": 0.25, "ch": 0.25, "cc": 0.25, "cr": 0.25}
-    _weight_sum = 1.0
-HDCM_WEIGHTS = {
-    key: max(value, 0.0) / _weight_sum
-    for key, value in _raw_hdcm_weights.items()
-}
-HDCM_AGGREGATION_MODE = os.getenv(
-    "HDCM_AGGREGATION_MODE",
-    "multiplicative",
-).strip().lower()
-
-_history_lock = threading.Lock()
-
 
 # ============================================================
 # General utility functions
@@ -169,99 +45,17 @@ def clamp(value):
     )
 
 
-def _load_recovery_history_unlocked():
-    if not RECOVERY_HISTORY_FILE.exists():
-        return {}
-
-    try:
-        payload = json.loads(
-            RECOVERY_HISTORY_FILE.read_text(encoding="utf-8")
-        )
-    except (OSError, json.JSONDecodeError):
-        return {}
-
-    return payload if isinstance(payload, dict) else {}
-
-
-def _save_recovery_history_unlocked(history):
-    temporary = RECOVERY_HISTORY_FILE.with_suffix(
-        RECOVERY_HISTORY_FILE.suffix + ".tmp"
-    )
-    temporary.write_text(
-        json.dumps(history, indent=2, sort_keys=True),
-        encoding="utf-8",
-    )
-    temporary.replace(RECOVERY_HISTORY_FILE)
-
-
-def get_recovery_history():
-    with _history_lock:
-        return _load_recovery_history_unlocked()
-
-
-def reset_recovery_history():
-    with _history_lock:
-        _save_recovery_history_unlocked({})
-
-
-def get_recovery_confidence(decision):
-    with _history_lock:
-        history = _load_recovery_history_unlocked()
-        record = history.get(decision, {})
-        successes = int(record.get("successes", 0))
-        executions = int(record.get("executions", 0))
-
-    denominator = (
-        executions
-        + RECOVERY_PRIOR_ALPHA
-        + RECOVERY_PRIOR_BETA
-    )
-    if denominator <= 0:
-        return 0.5
-
-    return clamp(
-        (successes + RECOVERY_PRIOR_ALPHA)
-        / denominator
-    )
-
-
-def update_recovery_history(decision, success):
-    with _history_lock:
-        history = _load_recovery_history_unlocked()
-        record = history.setdefault(
-            decision,
-            {"successes": 0, "executions": 0},
-        )
-        record["executions"] = int(record.get("executions", 0)) + 1
-        if success:
-            record["successes"] = int(record.get("successes", 0)) + 1
-        record["last_updated"] = datetime.now(timezone.utc).isoformat()
-        _save_recovery_history_unlocked(history)
-
-
 def calculate_hdcm_confidence(candidate):
     return (
-        max(candidate["ce"], 1e-9) ** HDCM_WEIGHTS["ce"]
-        * max(candidate["ch"], 1e-9) ** HDCM_WEIGHTS["ch"]
-        * max(candidate["cc"], 1e-9) ** HDCM_WEIGHTS["cc"]
-        * max(candidate["cr"], 1e-9) ** HDCM_WEIGHTS["cr"]
+        max(candidate["ce"], 1e-9) ** 0.25
+        * max(candidate["ch"], 1e-9) ** 0.25
+        * max(candidate["cc"], 1e-9) ** 0.25
+        * max(candidate["cr"], 1e-9) ** 0.25
     )
 
 
-def calculate_additive_confidence(candidate):
-    return clamp(
-        HDCM_WEIGHTS["ce"] * candidate["ce"]
-        + HDCM_WEIGHTS["ch"] * candidate["ch"]
-        + HDCM_WEIGHTS["cc"] * candidate["cc"]
-        + HDCM_WEIGHTS["cr"] * candidate["cr"]
-    )
-
-
-def rank_candidates(candidates, aggregation_mode=None):
+def rank_candidates(candidates):
     ranked = []
-    mode = (aggregation_mode or HDCM_AGGREGATION_MODE).lower()
-    if mode not in {"multiplicative", "additive"}:
-        mode = "multiplicative"
 
     for decision, values in candidates.items():
         candidate = {
@@ -269,14 +63,12 @@ def rank_candidates(candidates, aggregation_mode=None):
             "ce": values["ce"],
             "ch": values["ch"],
             "cc": values["cc"],
-            "cr": get_recovery_confidence(decision),
-            "aggregation_mode": mode,
+            "cr": values["cr"],
         }
 
-        if mode == "additive":
-            candidate["confidence"] = calculate_additive_confidence(candidate)
-        else:
-            candidate["confidence"] = calculate_hdcm_confidence(candidate)
+        candidate["confidence"] = (
+            calculate_hdcm_confidence(candidate)
+        )
 
         ranked.append(candidate)
 
@@ -285,33 +77,6 @@ def rank_candidates(candidates, aggregation_mode=None):
         key=lambda item: item["confidence"],
         reverse=True,
     )
-
-
-def evaluate_safety_gate(ranked):
-    selected = ranked[0]
-    second = ranked[1] if len(ranked) > 1 else {"confidence": 0.0}
-    margin = selected["confidence"] - second["confidence"]
-    reasons = []
-
-    if selected["decision"] not in AUTONOMOUS_ACTION_ALLOWLIST:
-        reasons.append("selected action is not on the autonomous-action allowlist")
-    if selected["confidence"] < MIN_AUTONOMOUS_CONFIDENCE:
-        reasons.append(
-            f"confidence {selected['confidence']:.3f} is below "
-            f"the autonomous threshold {MIN_AUTONOMOUS_CONFIDENCE:.3f}"
-        )
-    if margin < MIN_CONFIDENCE_MARGIN:
-        reasons.append(
-            f"confidence margin {margin:.3f} is below "
-            f"the ambiguity threshold {MIN_CONFIDENCE_MARGIN:.3f}"
-        )
-
-    return {
-        "allowed": not reasons,
-        "status": "autonomous" if not reasons else "operator_escalation",
-        "reason": "; ".join(reasons),
-        "confidence_margin": margin,
-    }
 
 
 # ============================================================
@@ -479,212 +244,94 @@ def collect_observation():
 # Recovery execution
 # ============================================================
 
-SCENARIO_FAULT_KEYS = {
-    "cpu": "cpu_load",
-    "memory": "memory_mb",
-    "dependency": "dependency_failure",
-    "latency": "latency_ms",
-    "errors": "error_probability",
-}
-
-
-def _fault_is_cleared(faults, scenario_key):
-    key = SCENARIO_FAULT_KEYS.get(scenario_key)
-    if key is None:
-        return True
-
-    value = faults.get(key)
-    if key == "dependency_failure":
-        return not bool(value)
-
-    try:
-        return abs(float(value or 0)) < 1e-12
-    except (TypeError, ValueError):
-        return False
-
-
-def verify_recovery(scenario_key):
-    attempts = 0
-    consecutive = 0
-
-    for attempt in range(1, RECOVERY_VERIFICATION_MAX_ATTEMPTS + 1):
-        attempts = attempt
-        response_ok = False
-        fault_cleared = False
-
-        try:
-            health_response = requests.get(
-                f"{APP_URL}/health",
-                timeout=5,
-            )
-            health_response.raise_for_status()
-            faults = health_response.json().get("faults", {})
-            fault_cleared = _fault_is_cleared(faults, scenario_key)
-
-            work_response = requests.get(
-                f"{APP_URL}/work",
-                timeout=5,
-            )
-            response_ok = work_response.status_code < 400
-        except (requests.RequestException, ValueError):
-            response_ok = False
-            fault_cleared = False
-
-        if response_ok and fault_cleared:
-            consecutive += 1
-            if consecutive >= RECOVERY_REQUIRED_CONSECUTIVE_CHECKS:
-                return {
-                    "success": True,
-                    "attempts": attempts,
-                    "consecutive_checks": consecutive,
-                }
-        else:
-            consecutive = 0
-
-        if attempt < RECOVERY_VERIFICATION_MAX_ATTEMPTS:
-            time.sleep(RECOVERY_VERIFICATION_INTERVAL_SECONDS)
-
-    return {
-        "success": False,
-        "attempts": attempts,
-        "consecutive_checks": consecutive,
-    }
-
-
-def apply_recovery_action(decision):
-    if ACTION_EXECUTION_MODE != "prototype_fault_reset":
-        raise RuntimeError(
-            "Only prototype_fault_reset execution mode is implemented in this "
-            "research prototype. Real restart/rollback/scale-out operations "
-            "must be provided by an infrastructure-specific adapter."
-        )
-
-    if decision == "Do Nothing":
-        return "No recovery action was executed."
+def execute_recovery(decision):
+    recovery_started = time.perf_counter()
 
     if decision == "Scale Out":
         clear_fault()
-        return (
-            "Prototype action: the injected CPU-pressure state was cleared, "
-            "representing restored processing capacity."
+
+        description = (
+            "CPU pressure was removed, representing "
+            "the addition of processing capacity."
         )
 
-    if decision == "Restart Service":
+    elif decision == "Restart Service":
         clear_fault()
-        return (
-            "Prototype action: the application fault state was reset, "
-            "representing service restart semantics."
+
+        description = (
+            "The application runtime state and "
+            "injected fault were reset."
         )
 
-    if decision == "Restart Dependency":
+    elif decision == "Restart Dependency":
         clear_fault()
-        return (
-            "Prototype action: the injected dependency failure was cleared, "
-            "representing dependency restart semantics."
+
+        description = (
+            "The dependency failure was cleared and "
+            "service communication was restored."
         )
 
-    if decision == "Circuit Breaker":
+    elif decision == "Circuit Breaker":
         clear_fault()
-        return (
-            "Prototype action: the injected dependency failure was cleared, "
-            "representing isolation/recovery semantics."
+
+        description = (
+            "The failed dependency was isolated and "
+            "the request path was restored."
         )
 
-    if decision == "Rollback":
+    elif decision == "Rollback":
         clear_fault()
-        return (
-            "Prototype action: the injected runtime fault was cleared, "
-            "representing rollback to a stable configuration."
+
+        description = (
+            "The latency-producing runtime configuration "
+            "was rolled back to the stable state."
         )
 
-    raise ValueError(f"Unsupported recovery decision: {decision}")
+    elif decision == "Do Nothing":
+        description = (
+            "No recovery action was executed."
+        )
 
+    else:
+        clear_fault()
 
-def build_safety_hold_result(safety):
-    return {
-        "success": False,
-        "recovery_attempted": False,
-        "executed_decision": "Operator Review",
-        "operator_escalation": True,
-        "safety_status": safety["status"],
-        "safety_reason": safety["reason"],
-        "action_execution_mode": ACTION_EXECUTION_MODE,
-        "recovery_verification_latency_ms": 0.0,
-        "verification_attempts": 0,
-        "description": (
-            "Autonomous execution was withheld by the safety gate. "
-            + safety["reason"]
-        ),
-    }
+        description = (
+            "The fault state was reset using "
+            "the default recovery procedure."
+        )
 
+    success = False
+    attempts = 0
 
-def execute_recovery(decision, scenario_key, safety):
-    if not safety["allowed"]:
-        return build_safety_hold_result(safety)
+    for attempt in range(1, 21):
+        attempts = attempt
 
-    # "Do Nothing" is an observation policy, not an active recovery operation.
-    # It is therefore not subjected to fault-clear recovery verification and is
-    # excluded from active-recovery success/latency statistics.
-    if decision == "Do Nothing":
-        return {
-            "success": None,
-            "recovery_attempted": False,
-            "executed_decision": "Do Nothing",
-            "operator_escalation": False,
-            "safety_status": "autonomous_observation",
-            "safety_reason": "",
-            "action_execution_mode": ACTION_EXECUTION_MODE,
-            "recovery_verification_latency_ms": None,
-            "verification_attempts": 0,
-            "description": "No active recovery was executed; the system remained under observation.",
-        }
+        try:
+            response = requests.get(
+                f"{APP_URL}/work",
+                timeout=5,
+            )
 
-    recovery_started = time.perf_counter()
+            if response.status_code < 400:
+                success = True
+                break
 
-    try:
-        description = apply_recovery_action(decision)
-        verification = verify_recovery(scenario_key)
-        success = verification["success"]
-        attempts = verification["attempts"]
-    except Exception as error:
-        success = False
-        attempts = 0
-        description = f"Recovery action failed before verification: {error}"
+        except requests.RequestException:
+            pass
 
-    recovery_verification_latency_ms = (
-        time.perf_counter() - recovery_started
+        time.sleep(0.5)
+
+    mttr_ms = (
+        time.perf_counter()
+        - recovery_started
     ) * 1000
-
-    update_recovery_history(decision, success)
 
     return {
         "success": success,
-        "recovery_attempted": True,
-        "executed_decision": decision,
-        "operator_escalation": not success,
-        "safety_status": (
-            "autonomous" if success else "operator_escalation_after_failure"
-        ),
-        "safety_reason": (
-            "" if success else "selected recovery action did not satisfy the recovery verification criteria"
-        ),
-        "action_execution_mode": ACTION_EXECUTION_MODE,
-        "recovery_verification_latency_ms": recovery_verification_latency_ms,
+        "mttr_ms": mttr_ms,
         "verification_attempts": attempts,
         "description": description,
     }
-
-
-def execute_ranked_recovery(ranked, scenario_key):
-    selected = ranked[0]
-    second = ranked[1] if len(ranked) > 1 else {"confidence": 0.0}
-    safety = evaluate_safety_gate(ranked)
-    recovery = execute_recovery(
-        selected["decision"],
-        scenario_key,
-        safety,
-    )
-    return selected, second, safety, recovery
 
 
 # ============================================================
@@ -694,10 +341,6 @@ def execute_ranked_recovery(ranked, scenario_key):
 CSV_FIELDS = [
     "timestamp",
     "scenario",
-    "severity",
-    "reference_policy_version",
-    "reference_policy_sha256",
-    "expected_decision",
     "cpu",
     "memory",
     "allocated_memory_mb",
@@ -705,8 +348,6 @@ CSV_FIELDS = [
     "error_rate",
     "dependency_available",
     "selected_decision",
-    "executed_decision",
-    "aggregation_mode",
     "ce",
     "ch",
     "cc",
@@ -716,12 +357,7 @@ CSV_FIELDS = [
     "correct",
     "decision_latency_ms",
     "recovery_success",
-    "recovery_attempted",
-    "operator_escalation",
-    "safety_status",
-    "safety_reason",
-    "action_execution_mode",
-    "recovery_verification_latency_ms",
+    "mttr_ms",
     "verification_attempts",
     "pre_availability",
     "post_availability",
@@ -757,8 +393,6 @@ def save_result(row):
 
 def build_result_row(
     scenario,
-    scenario_key,
-    severity,
     observation,
     selected,
     second,
@@ -775,10 +409,6 @@ def build_result_row(
             .isoformat()
         ),
         "scenario": scenario,
-        "severity": severity,
-        "reference_policy_version": REFERENCE_POLICY_VERSION,
-        "reference_policy_sha256": REFERENCE_POLICY_SHA256,
-        "expected_decision": expected_decision,
         "cpu": round(
             observation.get("cpu", 0),
             4,
@@ -818,8 +448,6 @@ def build_result_row(
         "selected_decision": (
             selected["decision"]
         ),
-        "executed_decision": recovery.get("executed_decision", ""),
-        "aggregation_mode": selected.get("aggregation_mode", HDCM_AGGREGATION_MODE),
         "ce": round(selected["ce"], 6),
         "ch": round(selected["ch"], 6),
         "cc": round(selected["cc"], 6),
@@ -841,19 +469,12 @@ def build_result_row(
             decision_latency_ms,
             6,
         ),
-        "recovery_success": (
-            "" if recovery.get("success") is None
-            else int(bool(recovery.get("success")))
+        "recovery_success": int(
+            recovery["success"]
         ),
-        "recovery_attempted": int(recovery.get("recovery_attempted", False)),
-        "operator_escalation": int(recovery.get("operator_escalation", False)),
-        "safety_status": recovery.get("safety_status", ""),
-        "safety_reason": recovery.get("safety_reason", ""),
-        "action_execution_mode": recovery.get("action_execution_mode", ACTION_EXECUTION_MODE),
-        "recovery_verification_latency_ms": (
-            ""
-            if recovery.get("recovery_verification_latency_ms") is None
-            else round(recovery.get("recovery_verification_latency_ms", 0.0), 4)
+        "mttr_ms": round(
+            recovery["mttr_ms"],
+            4,
         ),
         "verification_attempts": (
             recovery[
@@ -917,6 +538,7 @@ def calculate_cpu_scenario_scores(
                 + 0.30 * latency_signal
             ),
             "cc": 0.95,
+            "cr": 0.89,
         },
         "Restart Service": {
             "ce": clamp(
@@ -929,6 +551,7 @@ def calculate_cpu_scenario_scores(
                 + 0.45 * error_signal
             ),
             "cc": 0.80,
+            "cr": 0.91,
         },
         "Do Nothing": {
             "ce": clamp(
@@ -943,6 +566,7 @@ def calculate_cpu_scenario_scores(
                 1 - cpu_signal
             ),
             "cc": 0.45,
+            "cr": 0.40,
         },
     }
 
@@ -982,9 +606,11 @@ def run_cpu_scenario():
         - decision_started
     ) * 1000
 
-    selected, second, safety, recovery = execute_ranked_recovery(
-        ranked,
-        "cpu",
+    selected = ranked[0]
+    second = ranked[1]
+
+    recovery = execute_recovery(
+        selected["decision"]
     )
 
     post_load = generate_load(
@@ -1007,12 +633,10 @@ def run_cpu_scenario():
 
     row = build_result_row(
         scenario="CPU Resource Exhaustion",
-        scenario_key="cpu",
-        severity=severity,
         observation=observation,
         selected=selected,
         second=second,
-        expected_decision=get_reference_action("cpu", severity),
+        expected_decision="Scale Out",
         decision_latency_ms=decision_latency_ms,
         recovery=recovery,
         pre_load=pre_load,
@@ -1032,12 +656,9 @@ def run_cpu_scenario():
             decision_latency_ms
         ),
         recovery=recovery,
-        safety=safety,
         pre_recovery=pre_load,
         post_recovery=post_load,
         explanation=explanation,
-        expected_decision=get_reference_action("cpu", severity),
-        reference_policy_version=REFERENCE_POLICY_VERSION,
         csv_file=str(DATA_FILE),
     )
 
@@ -1085,6 +706,7 @@ def calculate_memory_scenario_scores(
                 + 0.10 * latency_signal
             ),
             "cc": 0.92,
+            "cr": 0.93,
         },
         "Scale Out": {
             "ce": clamp(
@@ -1098,6 +720,7 @@ def calculate_memory_scenario_scores(
                 + 0.30 * latency_signal
             ),
             "cc": 0.76,
+            "cr": 0.87,
         },
         "Do Nothing": {
             "ce": clamp(
@@ -1113,6 +736,7 @@ def calculate_memory_scenario_scores(
                 1 - allocated_signal
             ),
             "cc": 0.35,
+            "cr": 0.40,
         },
     }
 
@@ -1154,9 +778,11 @@ def run_memory_scenario():
         - decision_started
     ) * 1000
 
-    selected, second, safety, recovery = execute_ranked_recovery(
-        ranked,
-        "memory",
+    selected = ranked[0]
+    second = ranked[1]
+
+    recovery = execute_recovery(
+        selected["decision"]
     )
 
     post_load = generate_load(
@@ -1176,12 +802,12 @@ def run_memory_scenario():
 
     row = build_result_row(
         scenario="Memory Pressure",
-        scenario_key="memory",
-        severity=severity,
         observation=observation,
         selected=selected,
         second=second,
-        expected_decision=get_reference_action("memory", severity),
+        expected_decision=(
+            "Restart Service"
+        ),
         decision_latency_ms=decision_latency_ms,
         recovery=recovery,
         pre_load=pre_load,
@@ -1201,12 +827,9 @@ def run_memory_scenario():
             decision_latency_ms
         ),
         recovery=recovery,
-        safety=safety,
         pre_recovery=pre_load,
         post_recovery=post_load,
         explanation=explanation,
-        expected_decision=get_reference_action("memory", severity),
-        reference_policy_version=REFERENCE_POLICY_VERSION,
         csv_file=str(DATA_FILE),
     )
 
@@ -1256,6 +879,7 @@ def calculate_dependency_scenario_scores(
                 + 0.20 * error_signal
             ),
             "cc": 0.94,
+            "cr": 0.90,
         },
         "Circuit Breaker": {
             "ce": clamp(
@@ -1268,6 +892,7 @@ def calculate_dependency_scenario_scores(
                 + 0.25 * error_signal
             ),
             "cc": 0.91,
+            "cr": 0.87,
         },
         "Scale Out": {
             "ce": clamp(
@@ -1282,6 +907,7 @@ def calculate_dependency_scenario_scores(
                 + 0.40 * cpu_signal
             ),
             "cc": 0.55,
+            "cr": 0.78,
         },
         "Do Nothing": {
             "ce": clamp(
@@ -1296,6 +922,7 @@ def calculate_dependency_scenario_scores(
                 1 - dependency_signal
             ),
             "cc": 0.25,
+            "cr": 0.30,
         },
     }
 
@@ -1304,9 +931,6 @@ def calculate_dependency_scenario_scores(
 
 @app.post("/run/dependency")
 def run_dependency_scenario():
-    payload = request.get_json(silent=True) or {}
-    severity = float(payload.get("severity", 1.0))
-
     clear_fault()
     time.sleep(2)
 
@@ -1317,7 +941,7 @@ def run_dependency_scenario():
 
     apply_fault(
         "dependency",
-        severity,
+        1,
     )
 
     pre_load = generate_load(
@@ -1342,9 +966,11 @@ def run_dependency_scenario():
         - decision_started
     ) * 1000
 
-    selected, second, safety, recovery = execute_ranked_recovery(
-        ranked,
-        "dependency",
+    selected = ranked[0]
+    second = ranked[1]
+
+    recovery = execute_recovery(
+        selected["decision"]
     )
 
     post_load = generate_load(
@@ -1371,12 +997,12 @@ def run_dependency_scenario():
         scenario=(
             "Service Dependency Failure"
         ),
-        scenario_key="dependency",
-        severity=severity,
         observation=observation,
         selected=selected,
         second=second,
-        expected_decision=get_reference_action("dependency", severity),
+        expected_decision=(
+            "Restart Dependency"
+        ),
         decision_latency_ms=decision_latency_ms,
         recovery=recovery,
         pre_load=pre_load,
@@ -1398,12 +1024,9 @@ def run_dependency_scenario():
             decision_latency_ms
         ),
         recovery=recovery,
-        safety=safety,
         pre_recovery=pre_load,
         post_recovery=post_load,
         explanation=explanation,
-        expected_decision=get_reference_action("dependency", severity),
-        reference_policy_version=REFERENCE_POLICY_VERSION,
         csv_file=str(DATA_FILE),
     )
 
@@ -1469,6 +1092,7 @@ def calculate_latency_scenario_scores(
                 )
             ),
             "cc": 0.94,
+            "cr": 0.91,
         },
 
         "Restart Service": {
@@ -1484,6 +1108,7 @@ def calculate_latency_scenario_scores(
                 + 0.15 * cpu_signal
             ),
             "cc": 0.84,
+            "cr": 0.90,
         },
 
         "Scale Out": {
@@ -1502,6 +1127,7 @@ def calculate_latency_scenario_scores(
                 if cpu_signal >= 0.50
                 else 0.58
             ),
+            "cr": 0.86,
         },
 
         "Do Nothing": {
@@ -1516,6 +1142,7 @@ def calculate_latency_scenario_scores(
                 1 - latency_signal
             ),
             "cc": 0.25,
+            "cr": 0.30,
         },
     }
 
@@ -1564,9 +1191,11 @@ def run_latency_scenario():
         - decision_started
     ) * 1000
 
-    selected, second, safety, recovery = execute_ranked_recovery(
-        ranked,
-        "latency",
+    selected = ranked[0]
+    second = ranked[1]
+
+    recovery = execute_recovery(
+        selected["decision"]
     )
 
     post_load = generate_load(
@@ -1591,12 +1220,10 @@ def run_latency_scenario():
 
     row = build_result_row(
         scenario="Application Latency",
-        scenario_key="latency",
-        severity=severity,
         observation=observation,
         selected=selected,
         second=second,
-        expected_decision=get_reference_action("latency", severity),
+        expected_decision="Rollback",
         decision_latency_ms=decision_latency_ms,
         recovery=recovery,
         pre_load=pre_load,
@@ -1616,12 +1243,9 @@ def run_latency_scenario():
             decision_latency_ms
         ),
         recovery=recovery,
-        safety=safety,
         pre_recovery=pre_load,
         post_recovery=post_load,
         explanation=explanation,
-        expected_decision=get_reference_action("latency", severity),
-        reference_policy_version=REFERENCE_POLICY_VERSION,
         csv_file=str(DATA_FILE),
     )
 
@@ -1687,6 +1311,7 @@ def calculate_error_scenario_scores(
                 )
             ),
             "cc": 0.95,
+            "cr": 0.92,
         },
 
         "Restart Service": {
@@ -1702,6 +1327,7 @@ def calculate_error_scenario_scores(
                 + 0.15 * cpu_signal
             ),
             "cc": 0.86,
+            "cr": 0.90,
         },
 
         "Scale Out": {
@@ -1720,6 +1346,7 @@ def calculate_error_scenario_scores(
                 if cpu_signal >= 0.50
                 else 0.55
             ),
+            "cr": 0.84,
         },
 
         "Do Nothing": {
@@ -1734,6 +1361,7 @@ def calculate_error_scenario_scores(
                 1 - error_signal
             ),
             "cc": 0.20,
+            "cr": 0.25,
         },
     }
 
@@ -1782,9 +1410,11 @@ def run_error_scenario():
         - decision_started
     ) * 1000
 
-    selected, second, safety, recovery = execute_ranked_recovery(
-        ranked,
-        "errors",
+    selected = ranked[0]
+    second = ranked[1]
+
+    recovery = execute_recovery(
+        selected["decision"]
     )
 
     post_load = generate_load(
@@ -1811,12 +1441,10 @@ def run_error_scenario():
 
     row = build_result_row(
         scenario="Application Error Injection",
-        scenario_key="errors",
-        severity=severity,
         observation=observation,
         selected=selected,
         second=second,
-        expected_decision=get_reference_action("errors", severity),
+        expected_decision="Rollback",
         decision_latency_ms=decision_latency_ms,
         recovery=recovery,
         pre_load=pre_load,
@@ -1836,12 +1464,9 @@ def run_error_scenario():
             decision_latency_ms
         ),
         recovery=recovery,
-        safety=safety,
         pre_recovery=pre_load,
         post_recovery=post_load,
         explanation=explanation,
-        expected_decision=get_reference_action("errors", severity),
-        reference_policy_version=REFERENCE_POLICY_VERSION,
         csv_file=str(DATA_FILE),
     )
 
@@ -1951,12 +1576,12 @@ def run_batch_experiments():
                                 False,
                             )
                         ),
-                        "recovery_verification_latency_ms": (
+                        "mttr_ms": (
                             payload_data.get(
                                 "recovery",
                                 {},
                             ).get(
-                                "recovery_verification_latency_ms",
+                                "mttr_ms",
                                 0,
                             )
                         ),
@@ -2001,10 +1626,11 @@ def run_batch_experiments():
 # Multi-severity experimental campaign
 # ============================================================
 
+import threading
 import uuid
 
 
-CAMPAIGN_FILE = Path(os.getenv("CAMPAIGN_FILE", str(DATA_FILE.parent / "campaign_results_confirmatory.csv")))
+CAMPAIGN_FILE = DATA_FILE.parent / "campaign_results.csv"
 
 campaign_state = {
     "status": "idle",
@@ -2070,27 +1696,14 @@ CAMPAIGN_FIELDS = [
     "repetition",
     "scenario",
     "severity",
-    "reference_policy_version",
-    "reference_policy_sha256",
     "selected_decision",
-    "executed_decision",
-    "aggregation_mode",
     "expected_decision",
     "correct",
     "confidence",
     "confidence_margin",
-    "ce",
-    "ch",
-    "cc",
-    "cr",
     "decision_latency_ms",
     "recovery_success",
-    "recovery_attempted",
-    "operator_escalation",
-    "safety_status",
-    "safety_reason",
-    "action_execution_mode",
-    "recovery_verification_latency_ms",
+    "mttr_ms",
     "pre_availability",
     "post_availability",
     "availability_gain",
@@ -2103,6 +1716,13 @@ CAMPAIGN_FIELDS = [
 ]
 
 
+EXPECTED_DECISIONS = {
+    "cpu": "Scale Out",
+    "memory": "Restart Service",
+    "dependency": "Restart Dependency",
+    "latency": "Rollback",
+    "errors": "Rollback",
+}
 
 
 def save_campaign_result(row):
@@ -2129,7 +1749,7 @@ def save_campaign_result(row):
 
 def execute_campaign(
     campaign_id,
-    repetitions_by_scenario,
+    repetitions,
     selected_scenarios,
 ):
     campaign_state.update({
@@ -2148,11 +1768,10 @@ def execute_campaign(
     combinations = []
 
     for scenario in selected_scenarios:
-        scenario_repetitions = repetitions_by_scenario[scenario]
         for severity in CAMPAIGN_LEVELS[scenario]:
             for repetition in range(
                 1,
-                scenario_repetitions + 1,
+                repetitions + 1,
             ):
                 combinations.append(
                     (
@@ -2196,10 +1815,9 @@ def execute_campaign(
             pre = result["pre_recovery"]
             post = result["post_recovery"]
 
-            expected = get_reference_action(
-                scenario,
-                severity,
-            )
+            expected = EXPECTED_DECISIONS[
+                scenario
+            ]
 
             ranked = result[
                 "ranked_decisions"
@@ -2220,13 +1838,9 @@ def execute_campaign(
                 "repetition": repetition,
                 "scenario": scenario,
                 "severity": severity,
-                "reference_policy_version": REFERENCE_POLICY_VERSION,
-                "reference_policy_sha256": REFERENCE_POLICY_SHA256,
                 "selected_decision": (
                     selected["decision"]
                 ),
-                "executed_decision": recovery.get("executed_decision", ""),
-                "aggregation_mode": selected.get("aggregation_mode", HDCM_AGGREGATION_MODE),
                 "expected_decision": expected,
                 "correct": int(
                     selected["decision"]
@@ -2239,29 +1853,16 @@ def execute_campaign(
                     selected["confidence"]
                     - second_confidence
                 ),
-                "ce": selected.get("ce", 0),
-                "ch": selected.get("ch", 0),
-                "cc": selected.get("cc", 0),
-                "cr": selected.get("cr", 0),
                 "decision_latency_ms": (
                     result.get(
                         "decision_latency_ms",
                         0,
                     )
                 ),
-                "recovery_success": (
-                    "" if recovery.get("success") is None
-                    else int(bool(recovery.get("success")))
+                "recovery_success": int(
+                    recovery["success"]
                 ),
-                "recovery_attempted": int(recovery.get("recovery_attempted", False)),
-                "operator_escalation": int(recovery.get("operator_escalation", False)),
-                "safety_status": recovery.get("safety_status", ""),
-                "safety_reason": recovery.get("safety_reason", ""),
-                "action_execution_mode": recovery.get("action_execution_mode", ACTION_EXECUTION_MODE),
-                "recovery_verification_latency_ms": (
-                    "" if recovery.get("recovery_verification_latency_ms") is None
-                    else recovery.get("recovery_verification_latency_ms", 0)
-                ),
+                "mttr_ms": recovery["mttr_ms"],
                 "pre_availability": (
                     pre["availability"]
                 ),
@@ -2337,15 +1938,6 @@ def execute_campaign(
     })
 
 
-DEFAULT_REPETITIONS_BY_SCENARIO = {
-    "cpu": 6,
-    "memory": 5,
-    "dependency": 5,
-    "latency": 5,
-    "errors": 5,
-}
-
-
 @app.post("/campaign/start")
 def start_campaign():
     if campaign_state["status"] == "running":
@@ -2362,16 +1954,17 @@ def start_campaign():
         silent=True
     ) or {}
 
-    scalar_repetitions = payload.get("repetitions")
-    requested_repetitions = payload.get("repetitions_by_scenario", {})
+    repetitions = int(
+        payload.get(
+            "repetitions",
+            5,
+        )
+    )
 
-    repetitions_by_scenario = {}
-    for scenario, default_value in DEFAULT_REPETITIONS_BY_SCENARIO.items():
-        if scalar_repetitions is not None:
-            value = int(scalar_repetitions)
-        else:
-            value = int(requested_repetitions.get(scenario, default_value))
-        repetitions_by_scenario[scenario] = max(1, min(value, 20))
+    repetitions = max(
+        1,
+        min(repetitions, 20),
+    )
 
     selected_scenarios = payload.get(
         "scenarios",
@@ -2390,15 +1983,11 @@ def start_campaign():
             message="No valid scenarios selected.",
         ), 400
 
-    reset_history = bool(payload.get("reset_history", True))
-    if reset_history:
-        reset_recovery_history()
-
     campaign_id = str(uuid.uuid4())
 
     total = sum(
         len(CAMPAIGN_LEVELS[scenario])
-        * repetitions_by_scenario[scenario]
+        * repetitions
         for scenario in selected_scenarios
     )
 
@@ -2414,7 +2003,7 @@ def start_campaign():
         target=execute_campaign,
         args=(
             campaign_id,
-            repetitions_by_scenario,
+            repetitions,
             selected_scenarios,
         ),
         daemon=True,
@@ -2425,21 +2014,9 @@ def start_campaign():
     return jsonify(
         status="started",
         campaign_id=campaign_id,
-        repetitions_by_scenario={
-            scenario: repetitions_by_scenario[scenario]
-            for scenario in selected_scenarios
-        },
+        repetitions=repetitions,
         scenarios=selected_scenarios,
         total_episodes=total,
-        recovery_history_reset=reset_history,
-        reference_policy_version=REFERENCE_POLICY_VERSION,
-        reference_policy_sha256=REFERENCE_POLICY_SHA256,
-        reference_policy_file=str(REFERENCE_POLICY_FILE),
-        initial_recovery_confidence=(
-            RECOVERY_PRIOR_ALPHA / (RECOVERY_PRIOR_ALPHA + RECOVERY_PRIOR_BETA)
-            if RECOVERY_PRIOR_ALPHA + RECOVERY_PRIOR_BETA > 0
-            else 0.5
-        ),
         campaign_file=str(
             CAMPAIGN_FILE
         ),
@@ -2486,38 +2063,6 @@ def campaign_results():
     )
 
 
-@app.get("/reference-policy")
-def reference_policy():
-    return jsonify(
-        status="ok",
-        sha256=REFERENCE_POLICY_SHA256,
-        policy=REFERENCE_POLICY,
-    )
-
-
-@app.get("/history")
-def recovery_history():
-    return jsonify(
-        status="ok",
-        prior_alpha=RECOVERY_PRIOR_ALPHA,
-        prior_beta=RECOVERY_PRIOR_BETA,
-        history=get_recovery_history(),
-    )
-
-
-@app.post("/history/reset")
-def recovery_history_reset():
-    reset_recovery_history()
-    return jsonify(
-        status="reset",
-        initial_recovery_confidence=(
-            RECOVERY_PRIOR_ALPHA / (RECOVERY_PRIOR_ALPHA + RECOVERY_PRIOR_BETA)
-            if RECOVERY_PRIOR_ALPHA + RECOVERY_PRIOR_BETA > 0
-            else 0.5
-        ),
-    )
-
-
 # ============================================================
 # General API routes
 # ============================================================
@@ -2528,16 +2073,6 @@ def health():
         status="ok",
         service="ECDM Engine",
         data_file=str(DATA_FILE),
-        campaign_file=str(CAMPAIGN_FILE),
-        recovery_history_file=str(RECOVERY_HISTORY_FILE),
-        reference_policy_file=str(REFERENCE_POLICY_FILE),
-        reference_policy_version=REFERENCE_POLICY_VERSION,
-        reference_policy_sha256=REFERENCE_POLICY_SHA256,
-        hdcm_weights=HDCM_WEIGHTS,
-        hdcm_aggregation_mode=HDCM_AGGREGATION_MODE,
-        minimum_autonomous_confidence=MIN_AUTONOMOUS_CONFIDENCE,
-        minimum_confidence_margin=MIN_CONFIDENCE_MARGIN,
-        action_execution_mode=ACTION_EXECUTION_MODE,
     )
 
 
@@ -2574,14 +2109,6 @@ def routes():
             "/run/cpu",
             "/run/memory",
             "/run/dependency",
-            "/run/latency",
-            "/run/errors",
-            "/campaign/start",
-            "/campaign/status",
-            "/campaign/results",
-            "/reference-policy",
-            "/history",
-            "/history/reset",
         ]
     )
 
